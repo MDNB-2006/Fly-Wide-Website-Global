@@ -70,15 +70,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   useEffect(() => {
+    // Check if there's a cached local session active (sandbox / local fallback user)
+    const savedLocalSession = localStorage.getItem('flywide_active_local_user');
+    if (savedLocalSession) {
+      try {
+        const { mockUser, mockProfile } = JSON.parse(savedLocalSession);
+        setIsDemoUser(true);
+        setUser(mockUser);
+        setProfile(mockProfile);
+        setLoading(false);
+      } catch (err) {
+        console.error("Error loading local auth session", err);
+      }
+    }
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setLoading(true);
       if (currentUser) {
         setUser(currentUser);
         setIsDemoUser(false);
+        // Clear local session once we have a real Firebase verified auth session
+        localStorage.removeItem('flywide_active_local_user');
         await syncProfile(currentUser);
       } else {
         // If demo user is active, don't clear (handled separately), else clear
-        if (!isDemoUser) {
+        if (!isDemoUser && !localStorage.getItem('flywide_active_local_user')) {
           setUser(null);
           setProfile(null);
         }
@@ -131,8 +147,62 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfile(newProfile);
         setUser(result.user);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Register with email error:", error);
+      const errCode = error?.code || '';
+      const errMsg = String(error?.message || '').toLowerCase();
+      
+      // Fallback if Email/Password is disabled in Firebase console, or missing, or generic error
+      if (
+        errCode === 'auth/operation-not-allowed' || 
+        errCode === 'auth/configuration-not-found' || 
+        errMsg.includes('operation-not-allowed') || 
+        errMsg.includes('configuration-not-found')
+      ) {
+        console.warn("Firebase Email/Password provider not active. Using custom local user fallback.");
+        
+        const localUsersStr = localStorage.getItem('flywide_local_users') || '{}';
+        const localUsers = JSON.parse(localUsersStr);
+        
+        if (localUsers[email.toLowerCase()]) {
+          throw new Error("This email is already registered locally on this device. Please log in instead!");
+        }
+        
+        const localUid = `local-${Math.random().toString(36).substring(2, 9)}`;
+        localUsers[email.toLowerCase()] = {
+          password,
+          fullName,
+          passportNumber,
+          uid: localUid,
+          createdAt: new Date().toISOString()
+        };
+        
+        localStorage.setItem('flywide_local_users', JSON.stringify(localUsers));
+        
+        const mockUser = {
+          uid: localUid,
+          displayName: fullName,
+          email: email,
+          emailVerified: true,
+          isAnonymous: false,
+        } as User;
+        
+        const mockProfile: UserProfile = {
+          uid: localUid,
+          fullName,
+          email,
+          passportNumber,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        
+        setIsDemoUser(true);
+        setUser(mockUser);
+        setProfile(mockProfile);
+        
+        localStorage.setItem('flywide_active_local_user', JSON.stringify({ mockUser, mockProfile }));
+        return;
+      }
       throw error;
     } finally {
       setLoading(false);
@@ -147,8 +217,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setUser(result.user);
         await syncProfile(result.user);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Login with email error:", error);
+      const errCode = error?.code || '';
+      const errMsg = String(error?.message || '').toLowerCase();
+      
+      // If disabled/missing OR standard login credential mismatch, check local fallback database
+      if (
+        errCode === 'auth/operation-not-allowed' || 
+        errCode === 'auth/configuration-not-found' || 
+        errCode === 'auth/user-not-found' || 
+        errCode === 'auth/wrong-password' ||
+        errMsg.includes('operation-not-allowed') || 
+        errMsg.includes('configuration-not-found') ||
+        errMsg.includes('user-not-found') ||
+        errMsg.includes('wrong-password') ||
+        error.message?.includes('INVALID_LOGIN_CREDENTIALS')
+      ) {
+        const localUsersStr = localStorage.getItem('flywide_local_users') || '{}';
+        const localUsers = JSON.parse(localUsersStr);
+        const savedUser = localUsers[email.toLowerCase()];
+        
+        if (savedUser && savedUser.password === password) {
+          console.log("Local fallback user matched! Logging in.");
+          const mockUser = {
+            uid: savedUser.uid,
+            displayName: savedUser.fullName,
+            email: email,
+            emailVerified: true,
+            isAnonymous: false
+          } as User;
+          
+          const mockProfile: UserProfile = {
+            uid: savedUser.uid,
+            fullName: savedUser.fullName,
+            email: email,
+            passportNumber: savedUser.passportNumber,
+            createdAt: savedUser.createdAt || new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+          
+          setIsDemoUser(true);
+          setUser(mockUser);
+          setProfile(mockProfile);
+          
+          localStorage.setItem('flywide_active_local_user', JSON.stringify({ mockUser, mockProfile }));
+          return;
+        } else if (savedUser) {
+          throw new Error("Incorrect travel credentials password entered for this local account.");
+        } else if (errCode === 'auth/operation-not-allowed' || errMsg.includes('operation-not-allowed')) {
+          throw new Error("Account not found. Please click 'Register details' first to create your manual email account!");
+        }
+      }
       throw error;
     } finally {
       setLoading(false);
@@ -168,6 +288,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     if (isDemoUser) {
       setProfile(updatedProfile as UserProfile);
+      
+      const savedLocalSession = localStorage.getItem('flywide_active_local_user');
+      if (savedLocalSession) {
+        try {
+          const session = JSON.parse(savedLocalSession);
+          session.mockProfile = {
+            ...session.mockProfile,
+            fullName,
+            passportNumber,
+            updatedAt: new Date().toISOString()
+          };
+          localStorage.setItem('flywide_active_local_user', JSON.stringify(session));
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      const email = profile?.email;
+      if (email) {
+        const localUsersStr = localStorage.getItem('flywide_local_users') || '{}';
+        const localUsers = JSON.parse(localUsersStr);
+        if (localUsers[email.toLowerCase()]) {
+          localUsers[email.toLowerCase()].fullName = fullName;
+          localUsers[email.toLowerCase()].passportNumber = passportNumber;
+          localStorage.setItem('flywide_local_users', JSON.stringify(localUsers));
+        }
+      }
+
       setLoading(false);
       return;
     }
@@ -210,12 +358,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       updatedAt: new Date().toISOString()
     };
 
-    // Save mock test user directly to Firestore, which validates rules nicely
     try {
-      // Temporarily authenticate locally as demo
       setIsDemoUser(true);
       setUser(mockUser);
       setProfile(mockProfile);
+      localStorage.setItem('flywide_active_local_user', JSON.stringify({ mockUser, mockProfile }));
     } catch (error) {
       console.error("Demo login setup error:", error);
     } finally {
@@ -232,6 +379,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(null);
       setProfile(null);
       setIsDemoUser(false);
+      localStorage.removeItem('flywide_active_local_user');
     } catch (error) {
       console.error("Logout error:", error);
     } finally {
